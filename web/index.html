@@ -110,7 +110,19 @@
     </div>
 
     <script>
-      const API_BASE_URL = "%%API_BASE_URL%%";
+      // Caddy serves this page and proxies /api to the backend, so the API is
+      // same-origin and needs no base URL.
+      const API_BASE_URL = "";
+
+      // Plotly.js ignores UTC offsets in date strings and plots wall-clock
+      // time. The API sends x values as naive local wall clock, so any client
+      // side date we compare against them has to be formatted the same way.
+      // "sv-SE" gives "YYYY-MM-DD HH:MM:SS".
+      function toLocalWallClock(date, timeZone) {
+        return date
+          .toLocaleString("sv-SE", { timeZone: timeZone })
+          .replace(" ", "T");
+      }
 
       document.addEventListener("DOMContentLoaded", function () {
         const form = document.getElementById("city-search-form");
@@ -124,6 +136,7 @@
 
         // --- Time range state ---
         let currentView = "24h"; // '24h' | '96h'
+        let currentTimezone = "UTC"; // timezone of the city currently plotted
 
         function applyTimeRange() {
           const cells = plotsGrid.querySelectorAll(".plot-cell");
@@ -131,9 +144,14 @@
 
           let xRange;
           if (currentView === "24h") {
+            // Must be the city's wall clock, not the viewer's and not UTC:
+            // the x axis is in city local time.
             const start = new Date();
             const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
-            xRange = [start.toISOString(), end.toISOString()];
+            xRange = [
+              toLocalWallClock(start, currentTimezone),
+              toLocalWallClock(end, currentTimezone),
+            ];
           } else {
             // Restore auto-range so Plotly shows full extent of the data
             xRange = null;
@@ -304,6 +322,7 @@
             if (data.success) {
               statusMessage.innerHTML = "";
               const cityTimezone = data.timezone;
+              currentTimezone = cityTimezone;
 
               for (const [pollenType, plotData] of Object.entries(data.plots)) {
                 const cell = document.createElement("div");
@@ -373,10 +392,7 @@
             return;
           }
 
-          const cityLocalString = now.toLocaleString("sv-SE", {
-            timeZone: cityTimezone,
-          });
-          const plotlyDatetime = cityLocalString.replace(" ", "T");
+          const plotlyDatetime = toLocalWallClock(now, cityTimezone);
 
           if (!plotData.layout.shapes) plotData.layout.shapes = [];
           plotData.layout.shapes.push({

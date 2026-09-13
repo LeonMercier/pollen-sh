@@ -1,12 +1,12 @@
 ---
 title:
-  - Pollen ETL project
+  - Pollen forecast project
 author:
   - Léon Mercier
 theme:
   - Luebeck
 date:
-  - 22.2.2026
+  - 13.9.2026
 ---
 
 # What is this?
@@ -15,17 +15,16 @@ An ETL pipeline that downloads a pollen allergy forecast, builds charts from it 
 
 ## Check it out
 
-Repo: [https://github.com/LeonMercier/pollen](https://github.com/LeonMercier/pollen)
+Repo: [https://github.com/LeonMercier/pollen-sh](https://github.com/LeonMercier/pollen-sh)
 
-Static site: [https://stwebpollenprod.z1.web.core.windows.net/](https://stwebpollenprod.z1.web.core.windows.net/)
+Site: [http://www.pollencast.eu/](http://www.pollencast.eu/)
 
 # Motivation
 
 - Learn:
   - Data engineering concepts
   - Python
-  - Databricks
-  - Azure services
+  - Self-hosting and containers
   - Infrastructure as code
 - Create a resource for pollen allergy sufferers to manage their symptoms
   - Easily see what days and times of day symptoms are likely to happen
@@ -51,99 +50,163 @@ Static site: [https://stwebpollenprod.z1.web.core.windows.net/](https://stwebpol
 # The data source
 
 - EU Copernicus: European Union's Earth Observation Programme
-- Releases daily
+- Releases daily, guaranteed complete at 10:00 UTC
 - 96 hours length, 1 hour granularity
 - All of continental Europe and Iceland
 - 0.1 degree grid (about 10 km x 10 km grid cells)
 - Six pollen types
 
-# The pipeline
+# From Azure to a single VPS
 
-- Each stage as a Databricks notebook
-- Trigger daily from Azure Data Factory
-- Use Databricks widgets to pass return values between stages
-- Medallion architecture
-  - Bronze: GRIB file
-  - Silver: Parquet file
-  - Gold: SQL database
+The first version ran on Azure: Data Factory orchestrating pySpark notebooks on
+Databricks, PostgreSQL Flexible Server, App Service, Blob Storage, all built by
+Terraform.
 
-- Sample from the SQL table
+It worked, but for a low-traffic portfolio site it was a lot of moving parts —
+and a lot of monthly cost.
 
-\tiny
+The rewrite targets one VPS. Same data, same charts, four containers.
 
-| id  | start_date | load_timestamp | constituent_type | latitude  | longitude | constituent_value | forecast_time |
-| --- | ---------- | -------------- | ---------------- | --------- | --------- | ----------------- | ------------- |
-| 1   | 2026-02-22 | 2026-02-22     | Alnus            | 60.950000 | 2.050000  | 6.7680            | 0             |
-| 12  | 2026-02-22 | 2026-02-22     | Betula           | 60.950000 | 2.050000  | 8.2321            | 0             |
-| 55  | 2026-02-22 | 2026-02-22     | Alnus            | 55.250000 | 23.150000 | 0.1231            | 2             |
-| 453 | 2026-02-22 | 2026-02-22     | Betula           | 54.150000 | 2.050000  | 0.1432            | 2             |
-
-\normalsize
-
-# Extract
-
-- Use `CDSApi` package
-- Formulate request for current date
-- Execute request
-- Save data to Datacricks storage
-- Return filename (uses Databricks widgets)
-
-# Transform
-
-- GRIB binary format: process with `pygrib` package
-- Data is gridded, needs to be flattened for SQL
-- 700\*420 grid cells \* 96 hours \* 6 pollen types:
-  - turns into 170 million rows in long format
-- file contains multiple messages containing a complete geographical grid
-  - ex. 5 pollen types \* 6 forecast time points = 30 messages
-- extract the coordinates of the grid
-- extract value for each grid point
-- flatten everything and put in a dict
-- transform dict into a dataframe
-- Save as parquet to Databricks storage
-
-# Load
-
-- Create the database schema if it doesnt exist
-- Read parquet file from transform stage
-- Add timestamp for when data is loaded
-- Use `TRUNCATE` so that old forecast it overwritten
-- Question: This is a big write: will the database return inconsistent data during the write?
-  - Do we need to write into a temporary table and then swap tables when everything is written?
-
-# Plot
+# The new stack
 
 \small
 
-- Use `plotly` package
-  - Creates plots that are web-native and can be embedded into a web page as responsive components
-- Read from SQL
-- In the data `forecast_time` is given as hours since start of forecast
-  - calculate actual datetimes for nicer presentation
-- Generate plots, glue them together into on HTML file
-- Upload to Azure web storage
+| Layer | Before | After |
+| --- | --- | --- |
+| Orchestration | Azure Data Factory | systemd timer |
+| Processing | pySpark on Databricks | plain Python + numpy |
+| Database | Azure PostgreSQL | PostgreSQL 17 in a container |
+| Backend | Azure App Service | FastAPI + uvicorn |
+| Frontend | Azure Blob static site | Caddy serving static files |
+| TLS | — | Caddy, automatic |
+| IaC | Terraform | Compose + a systemd unit |
 
 \normalsize
 
-![image](../static-site-screenshot-2026-02-23-cropped.png)
+# The key insight: the data is small
 
-# Infrastructure
+The old pipeline had elaborate batching — accumulate five GRIB messages, convert
+to Spark, write parquet, call the garbage collector, repeat.
 
-- Terraform was adopted early:
-  - Clicking in Azure portal is tedious
-  - `terraform destroy` is a nice assurance that everything goes down and no costs are incurred
-  - Goal is to have the Gitub repo in a state where someone can clone it and get started very quickly
+That existed to work around Databricks JVM memory behaviour, not because the
+data is big:
+
+- Bounding box: 171 x 214 = **36,594 grid cells**
+- 6 species x 97 hourly leadtimes = **582 GRIB messages**
+- Whole forecast as float32: **81 MB**
+
+It fits in memory. So: read the GRIB straight into one numpy array, load it in a
+single pass. No batching, no silver layer, no Spark.
+
+# Shaping the table around the query
+
+The API only ever asks one thing: *every hourly value at one grid cell*.
+
+Long format — one row per (cell, species, hour) — answers that with 582 rows and
+costs 21.3 M rows per day.
+
+Instead, store the whole 97-hour series for a (cell, species) pair in one
+`real[]` column:
+
+\small
+
+| | Long format | Array format |
+| --- | --- | --- |
+| Rows per run | 21,300,000 | **219,564** |
+| On disk | ~2.6 GB | **104 MB** |
+| Load time | 3–5 min | **10 s** |
+| Rows per API query | 582 | **6** |
+
+\normalsize
+
+A denormalised serving layer, shaped to the access pattern.
+
+# Geocoding without a spatial database
+
+Each city has to be matched to its nearest forecast grid cell.
+
+The old version: Spark cross join of 5,450 cities against 36,594 grid points —
+199 million pairs — then a window function ranking by Haversine distance.
+
+But the grid is *regular*. So the nearest cell is just:
+
+```python
+lat_idx = round((lat - lat0) / step)
+lon_idx = round((lon - lon0) / step)
+```
+
+Locally, great-circle distance is near-monotone in a separable quantity, so
+rounding each axis independently minimises it.
+
+# Does that actually hold?
+
+Checked by brute force against real Haversine, over every city and every cell:
+
+\small
+
+| | |
+| --- | --- |
+| Cities snapped to a genuinely farther cell | 10 of 5,450 |
+| Worst excess distance | **1.7 m** |
+| Mean city-to-cell distance | 3.39 km |
+| Grid cell size | ~11 km |
+
+\normalsize
+
+The disagreements are all cities sitting within about 2 metres of exactly
+equidistant between two neighbours.
+
+199 million distance calculations replaced by two `round()` calls — and no
+PostGIS.
+
+# Zero-downtime loads
+
+The daily load still uses a blue-green swap:
+
+1. `COPY` into a staging table
+2. Build the primary key there
+3. Validate: exact row count, all 6 species, every array 97 long
+4. Rename staging into place, in one transaction, together with the run metadata
+5. Drop the old table
+
+A failed run changes nothing — yesterday's forecast simply stays live. The API
+can never read a start time that disagrees with the data it indexes into.
+
+# Not hardcoding what you can discover
+
+The grid origin and spacing are read out of the GRIB file on every run and
+written to a `grid` table.
+
+Nothing downstream assumes where the CAMS grid points sit. If Copernicus changes
+the grid, the pipeline fails loudly instead of silently mis-snapping every city
+in the database.
+
+Same idea for the pollen species: olive arrives as the bare numeric code
+`64002`, which is normalised at the boundary so no magic number reaches the
+database.
+
+# Results
+
+\small
+
+| | |
+| --- | --- |
+| Full daily run | 110 s (99 s of that is the download) |
+| Database load | 10 s |
+| Whole database | 113 MB |
+| API response, all 6 charts | 62 KB |
+| Pipeline peak memory | < 200 MB |
+| VPS needed | 2 GB RAM, 20 GB disk |
+
+\normalsize
+
+Backups are deliberately minimal: the forecast is regenerated daily and there is
+no user data.
 
 # Future directions
 
-- Move from MSSQL to PostgreSQL for cost savings
-- Get a domain name
 - Localize plots to Finnish
-- Localize pollen types from Latin to English
-- Implements history browser (but needs different database strategy?)
-- Make a nicer looking web frontend
-- Create a backend service
-  - User requests "Helsinki" -> backend finds correct grid cell and generates plot
+- History browser (the array schema makes appending past runs easy)
 - Allow users to subscribe to alerts via email
 - Mobile app
   - Homescreen widget

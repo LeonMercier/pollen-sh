@@ -1,0 +1,83 @@
+name: pollen
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-pollen}
+      POSTGRES_USER: ${POSTGRES_USER:-pollen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      # Only runs on a fresh volume. The pipeline reapplies the same file on
+      # every run, so a schema change does not need a volume reset.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pollen} -d ${POSTGRES_DB:-pollen}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  api:
+    build:
+      context: ./api
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-pollen}
+      POSTGRES_USER: ${POSTGRES_USER:-pollen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      MAX_FORECAST_AGE_HOURS: ${MAX_FORECAST_AGE_HOURS:-36}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  caddy:
+    image: docker.io/library/caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    environment:
+      # ":80" locally (plain HTTP); the bare domain in production, which makes
+      # Caddy obtain and renew a certificate automatically.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    volumes:
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web:/srv/web:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+
+  # Run-to-completion, never started by `compose up`. Driven by a systemd timer
+  # in production and by `task pipeline` by hand.
+  pipeline:
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+    profiles: ["manual"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-pollen}
+      POSTGRES_USER: ${POSTGRES_USER:-pollen}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CDSAPI_URL: ${CDSAPI_URL}
+      CDSAPI_KEY: ${CDSAPI_KEY}
+      HEALTHCHECK_URL: ${HEALTHCHECK_URL:-}
+      BRONZE_RETENTION_DAYS: ${BRONZE_RETENTION_DAYS:-7}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - bronze:/data/bronze
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  caddy_data:
+  caddy_config:
+  bronze:

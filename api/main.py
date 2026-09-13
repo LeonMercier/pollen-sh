@@ -1,194 +1,112 @@
-"""
-Pollen ETL API
+"""Pollen forecast API.
 
-FastAPI application providing pollen forecast data.
-The frontend is served as a static file hosted separately (frontend/index.html).
+Caddy serves the static frontend and reverse-proxies /api and /health to this
+app, so the two are same-origin and there is no CORS configuration.
 """
 
-import json
+import logging
 import os
-import sys
-
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 
-# local modules
-from database import lookup_city_coordinates, search_cities
-from plot import plot, plot_by_type
+from fastapi import FastAPI, Query
+from fastapi.responses import JSONResponse
 
-# Startup logging
-print("=" * 60)
-print("Pollen ETL API - Starting up")
-print(f"Python version: {sys.version}")
-print(f"Working directory: {os.getcwd()}")
-print(f"ENV mode: {os.getenv('ENV', 'production')}")
-print(f"ALLOWED_ORIGINS: {os.getenv('ALLOWED_ORIGINS', '(not set)')}")
-print("=" * 60)
+import config
+import db
+from plot import build_figures
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+)
+log = logging.getLogger("api")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Startup event to validate database configuration.
-    Logs configuration but doesn't fail if database is unreachable
-    (allows app to start even if DB is temporarily down).
-    The first part of the function, before the yield, will be executed before the application starts.
-    And the part after the yield will be executed after the application has finished.
-    """
-    print("Running startup checks...")
-    try:
-        from database import _get_db_config
-
-        config = _get_db_config()
-        print(f"✓ Database configuration loaded successfully")
-        print(f"  Host: {config['host']}")
-        print(f"  Database: {config['dbname']}")
-        print(f"  SSL Mode: {config['sslmode']}")
-    except Exception as e:
-        print(f"✗ Database configuration error: {e}")
-        print("  App will continue but database queries will fail")
-
-    print("Startup checks complete")
-    print("=" * 60)
+    # The pool opens lazily: the API must start even when the database is
+    # briefly unavailable, and report that through /health instead.
+    db.open_pool()
+    log.info("Connection pool created")
     yield
+    db.close_pool()
 
 
 app = FastAPI(
-    title="Pollen ETL API",
-    description="API for Pollen ETL data pipeline",
-    version="0.1.0",
+    title="Pollen forecast API",
+    description="Hourly pollen forecasts for European cities, from CAMS data",
+    version="1.0.0",
     lifespan=lifespan,
-)
-
-# Allow the static frontend (Azure Blob Storage or localhost) to call this API.
-# ALLOWED_ORIGINS is a comma-separated list of origins, e.g.:
-#   http://localhost:8000,https://stwebpollenprod.z6.web.core.windows.net
-_allowed_origins = os.environ.get("ALLOWED_ORIGINS", "")
-# List comprehension
-# split comma separated list, strip whitespace and empty strings
-origins = [o.strip() for o in _allowed_origins.split(",") if o.strip()]
-
-print(f"CORS origins configured: {origins}")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_methods=["GET"],
-    allow_headers=["*"],
 )
 
 
 @app.get("/api/cities")
-async def api_cities(q: str = Query(min_length=2)):
-    """
-    City autocomplete endpoint. Returns up to 10 city suggestions for a
-    given prefix query (case-insensitive match on ASCII city name).
-
-    Query params:
-        q: Prefix string to search for (minimum 2 characters)
-
-    Returns:
-        JSON list of objects with 'name', 'ascii_name', and 'country_code'.
-    """
-    return search_cities(q)
-
-
-@app.get("/api/plot")
-async def api_plot(city: str | None = None):
-    """
-    API endpoint that returns plot data as JSON.
-    Used by AJAX frontend to load plots without page reload.
-
-    Query params:
-        city: City name to search for
-
-    Returns:
-        JSON with 'success', 'plotly_data', 'plotly_layout', 'plotly_config', and optional 'error' fields
-    """
-    if not city:
-        return {"success": False, "error": "City parameter is required"}
-
-    # Look up city coordinates and timezone
-    result = lookup_city_coordinates(city)
-
-    if not result:
-        return {"success": False, "error": f"City '{city}' not found"}
-
-    # Unpack coordinates, timezone, and canonical city name
-    lat, lon, timezone_name, canonical_city_name = result
-
+async def api_cities(q: str = Query(min_length=2, max_length=100)):
+    """City autocomplete: up to 10 suggestions for a name prefix."""
     try:
-        fig = plot(lat, lon, timezone_name)  # Pass timezone to plot function
-
-        # Use Plotly's built-in JSON serialization (idiomatic way)
-        fig_json_str = fig.to_json()
-        fig_data = json.loads(fig_json_str)
-
-        return {
-            "success": True,
-            "city": canonical_city_name,
-            "lat": lat,
-            "lon": lon,
-            "timezone": timezone_name,
-            "plotly_data": fig_data["data"],
-            "plotly_layout": fig_data["layout"],
-            "plotly_config": {"responsive": True},
-        }
-    except Exception as e:
-        return {"success": False, "error": "Error generating plot"}
+        return db.search_cities(q)
+    except Exception:
+        log.exception("City search failed for %r", q)
+        return []
 
 
 @app.get("/api/plots")
-async def api_plots(city: str | None = None):
-    """
-    API endpoint that returns one Plotly figure per pollen type as JSON.
-    Used by the frontend to render a responsive grid of charts.
-
-    Query params:
-        city: City name to search for
-
-    Returns:
-        JSON with 'success', 'city', 'lat', 'lon', and 'plots' dict keyed by
-        pollen display name, each containing 'data', 'layout', and 'config'.
-    """
+async def api_plots(city: str | None = Query(default=None, max_length=100)):
+    """One Plotly figure per pollen species for the named city."""
     if not city:
         return {"success": False, "error": "City parameter is required"}
 
-    result = lookup_city_coordinates(city)
-
-    if not result:
-        return {"success": False, "error": f"City '{city}' not found"}
-
-    lat, lon, timezone_name, canonical_city_name = result
     try:
-        figures = plot_by_type(lat, lon, timezone_name, canonical_city_name)
+        match = db.lookup_city(city)
+        if match is None:
+            return {"success": False, "error": f"City '{city}' not found"}
 
-        plots = {}
-        for display_name, fig in figures.items():
-            fig_data = json.loads(fig.to_json())
-            plots[display_name] = {
-                "data": fig_data["data"],
-                "layout": fig_data["layout"],
-                "config": {"responsive": True},
-            }
+        forecast = db.get_forecast(match.lat_idx, match.lon_idx)
+        if forecast is None:
+            return {"success": False, "error": "No forecast data is loaded yet"}
+
+        grid = db.get_grid()
+        lat, lon = (
+            grid.coords_of(match.lat_idx, match.lon_idx) if grid else (None, None)
+        )
 
         return {
             "success": True,
-            "city": canonical_city_name,
+            "city": match.name,
             "lat": lat,
             "lon": lon,
-            "timezone": timezone_name,
-            "plots": plots,
+            "timezone": match.timezone,
+            "plots": build_figures(forecast, match.timezone, match.name),
         }
-    except Exception as e:
-        print(f"Error generating plots for '{city}': {e}")
+    except Exception:
+        log.exception("Failed to build plots for %r", city)
         return {"success": False, "error": "Error generating plots"}
 
 
 @app.get("/health")
 async def health():
+    """Liveness plus data freshness.
+
+    A stale forecast is the realistic failure here -- the API can be perfectly
+    healthy while the daily pipeline has been dead for a week.
     """
-    Health check endpoint for monitoring.
-    """
-    return {"status": "healthy"}
+    try:
+        age = db.forecast_age_hours()
+    except Exception as exc:
+        log.warning("Health check could not reach the database: %s", exc)
+        return JSONResponse(
+            status_code=503, content={"status": "unhealthy", "reason": "database unreachable"}
+        )
+
+    if age is None:
+        return JSONResponse(
+            status_code=503, content={"status": "unhealthy", "reason": "no forecast loaded"}
+        )
+
+    stale = age > config.MAX_FORECAST_AGE_HOURS
+    body = {
+        "status": "degraded" if stale else "healthy",
+        "forecast_age_hours": round(age, 1),
+        "max_age_hours": config.MAX_FORECAST_AGE_HOURS,
+    }
+    return JSONResponse(status_code=503 if stale else 200, content=body)

@@ -1,306 +1,76 @@
 version: "3"
 
-# Pollen ETL - Task Runner Configuration
-# Use 'task --list' to see all available tasks
+# Task runner for the pollen forecast stack. `task --list` shows everything.
+#
+# COMPOSE can be overridden if you use docker instead of podman:
+#   COMPOSE="docker compose" task up
 
 vars:
-  POSTGRES_CONTAINER: pollen-postgres-local
-  API_DIR: api
+  COMPOSE: '{{.COMPOSE | default "podman-compose"}}'
 
 tasks:
   default:
     desc: Show available tasks
-    cmds:
-      - task --list
+    cmds: [task --list]
     silent: true
 
-  # ========================================
-  # Local Development - PostgreSQL
-  # ========================================
-
-  local:up:
-    desc: Start local PostgreSQL container
+  # ==========================================================================
+  # Stack
+  # ==========================================================================
+  up:
+    desc: Build and start postgres, api and caddy
     cmds:
-      - echo "Starting local PostgreSQL..."
-      - docker-compose up -d
-      - echo "Waiting for PostgreSQL to be healthy..."
-      - timeout 30 bash -c 'until docker exec {{.POSTGRES_CONTAINER}} pg_isready -U pollen_user; do sleep 1; done'
-      - echo "Local PostgreSQL is ready on localhost:5432!"
-      - echo 'Next steps:'
-      - echo 'Sync data from Azure, go-task local:sync'
-      - echo 'Run API locally, go-task local:api'
+      - "{{.COMPOSE}} up -d --build"
+      - 'echo "Site: http://localhost:${HTTP_PORT:-8080}"'
 
-  local:down:
-    desc: Stop local PostgreSQL container
+  down:
+    desc: Stop the stack (data volumes persist)
+    cmds: ["{{.COMPOSE}} down"]
+
+  logs:
+    desc: Follow logs from all services
+    cmds: ["{{.COMPOSE}} logs -f"]
+
+  ps:
+    desc: Show container status
+    cmds: ["{{.COMPOSE}} ps"]
+
+  psql:
+    desc: Open a psql shell on the database
     cmds:
-      - echo "Stopping local PostgreSQL..."
-      - docker-compose down
-      - echo "Stopped (data persists in volume)"
+      - "{{.COMPOSE}} exec postgres psql -U ${POSTGRES_USER:-pollen} -d ${POSTGRES_DB:-pollen}"
 
-  local:logs:
-    desc: Show PostgreSQL container logs
+  clean:
+    desc: Stop everything and delete all volumes (destroys the database)
+    prompt: This deletes the database and every cached GRIB. Continue?
+    cmds: ["{{.COMPOSE}} down -v"]
+
+  # ==========================================================================
+  # Pipeline
+  # ==========================================================================
+  pipeline:
+    desc: Run the daily ETL now (reuses today's cached GRIB if present)
+    cmds: ["{{.COMPOSE}} --profile manual run --rm --no-deps pipeline {{.CLI_ARGS}}"]
+
+  pipeline:reprocess:
+    desc: Rebuild the database from the newest cached GRIB, without calling CDS
     cmds:
-      - docker-compose logs -f postgres
+      - "{{.COMPOSE}} --profile manual run --rm --no-deps pipeline --skip-extract"
 
-  local:sync:
-    desc: Sync database from Azure dev environment
+  geocode:
+    desc: Reload the cities table from GeoNames (run after the first pipeline run)
     cmds:
-      - echo "Syncing database from Azure..."
-      - bash scripts/sync_db_from_azure.sh
+      - "{{.COMPOSE}} --profile manual run --rm --no-deps --entrypoint python pipeline -m pipeline.geocode"
 
-  local:shell:
-    desc: Open psql shell in local database
+  # ==========================================================================
+  # Checks
+  # ==========================================================================
+  health:
+    desc: Query the health endpoint
     cmds:
-      - docker exec -it {{.POSTGRES_CONTAINER}} psql -U pollen_user -d pollen
+      - 'curl -fsS "http://localhost:${HTTP_PORT:-8080}/health" && echo'
 
-  local:reset:
-    desc: Reset local database (WARNING - deletes all data)
-    prompt: This will delete all local data. Continue?
+  smoke:
+    desc: End-to-end check against the running stack
     cmds:
-      - echo "Resetting local database..."
-      - docker-compose down -v
-      - docker-compose up -d
-      - echo "Waiting for PostgreSQL to be healthy..."
-      - timeout 30 bash -c 'until docker exec {{.POSTGRES_CONTAINER}} pg_isready -U pollen_user; do sleep 1; done'
-      - echo "Database reset complete"
-      - echo "Run 'task local:sync' to restore data from Azure"
-
-  local:status:
-    desc: Check status of local services
-    cmds:
-      - echo "Checking local service status..."
-      - docker ps --filter "name={{.POSTGRES_CONTAINER}}"
-
-  # ========================================
-  # Local Development - FastAPI
-  # ========================================
-
-  local:api:
-    desc: Run FastAPI locally (connects to local PostgreSQL)
-    cmds:
-      - echo "Starting FastAPI on http://localhost:8000..."
-      - echo "Running in local mode (ENV=local)"
-      - echo "Auto-reload enabled - edit files to see changes"
-      - cd {{.API_DIR}} && ENV=local uvicorn main:app --reload --host 0.0.0.0 --port 8000
-
-  # local:api:prod:
-  #   desc: Run FastAPI locally without reload (production-like)
-  #   cmds:
-  #     - echo "Starting FastAPI on http://localhost:8000 (production mode)..."
-  #     - cd {{.API_DIR}} && ENV=local uvicorn main:app --host 0.0.0.0 --port 8000
-
-  local:frontend:
-    desc: Serve the frontend locally on http://localhost:3000 (API must be on http://localhost:8000)
-    vars:
-      SERVE_DIR: /tmp/pollen-frontend
-    cmds:
-      - mkdir -p {{.SERVE_DIR}}
-      - sed 's|%%API_BASE_URL%%|http://localhost:8000|g' frontend/index.html > {{.SERVE_DIR}}/index.html
-      - cp frontend/styles.css {{.SERVE_DIR}}/styles.css
-      - echo "Frontend available at http://localhost:3000"
-      - echo "Make sure the API is running (task local:api)"
-      - python -m http.server 3000 --directory {{.SERVE_DIR}}
-
-  # ========================================
-  # Local Development - Combined Workflows
-  # ========================================
-
-  local:setup:
-    desc: First-time setup - start DB, sync data
-    cmds:
-      - task: local:up
-      - task: local:sync
-      - echo ""
-      - echo "Local environment is ready!"
-      - echo "Start the API with, task local:api"
-
-  local:clean:
-    desc: Stop containers and remove volumes (complete cleanup)
-    prompt: This will delete all containers and volumes. Continue?
-    cmds:
-      - echo "Cleaning up local environment..."
-      - docker-compose down -v
-      - echo "Cleanup complete"
-
-  # ========================================
-  # Deployment
-  # ========================================
-
-  # TODO: add checks for finished deployment and finished 'webapp start'
-  remote:deployapi:dev:
-    desc: Deploy api code to Azure App Service (dev)
-    vars:
-      TF_DIR: infra/environments/dev
-      APP_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw app_service_name
-      RG_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw resource_group_name
-    cmds:
-      # Zip from api dir, exclude junk
-      - cd ./api && zip -r ../api-deploy.zip . -x "*__pycache__*" -x "*.pyc" -x "*.pyo"
-
-      # Deploy (blocks until Oryx build completes)
-      - az webapp deploy
-        --async false
-        --clean true
-        --name {{.APP_NAME}}
-        --resource-group {{.RG_NAME}}
-        --restart false
-        --src-path ./api-deploy.zip
-        --timeout 600
-        --track-status false
-
-      - rm ./api-deploy.zip
-
-      # Verify the deployment actually succeeded before starting
-      - |
-        STATUS=$(az webapp log deployment list \
-          --name {{.APP_NAME}} \
-          --resource-group {{.RG_NAME}} \
-          --query "[0].status" -o tsv)
-        echo "Deployment status: $STATUS"
-        if [ "$STATUS" != "4" ] && [ "$STATUS" != "Success" ]; then
-          echo "Deployment did not succeed (status: $STATUS), aborting start"
-          exit 1
-        fi
-
-      # Only start if deployment succeeded
-      - az webapp start --name {{.APP_NAME}} --resource-group {{.RG_NAME}}
-
-  remote:deployapi:prod:
-    desc: Deploy api code to Azure App Service (prod)
-    vars:
-      TF_DIR: infra/environments/prod
-      APP_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw app_service_name
-      RG_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw resource_group_name
-    cmds:
-      # Zip from api dir, exclude junk
-      - cd ./api && zip -r ../api-deploy.zip . -x "*__pycache__*" -x "*.pyc" -x "*.pyo"
-
-      # Deploy (blocks until Oryx build completes)
-      - az webapp deploy
-        --async false
-        --clean true
-        --name {{.APP_NAME}}
-        --resource-group {{.RG_NAME}}
-        --restart false
-        --src-path ./api-deploy.zip
-        --timeout 600
-        --track-status false
-
-      - rm ./api-deploy.zip
-
-      # Verify the deployment actually succeeded before starting
-      - |
-        STATUS=$(az webapp log deployment list \
-          --name {{.APP_NAME}} \
-          --resource-group {{.RG_NAME}} \
-          --query "[0].status" -o tsv)
-        echo "Deployment status: $STATUS"
-        if [ "$STATUS" != "4" ] && [ "$STATUS" != "Success" ]; then
-          echo "Deployment did not succeed (status: $STATUS), aborting start"
-          exit 1
-        fi
-
-      # Only start if deployment succeeded
-      - az webapp start --name {{.APP_NAME}} --resource-group {{.RG_NAME}}
-
-  remote:deployfrontend:dev:
-    desc: Deploy frontend to Azure Blob Storage static website (dev)
-    vars:
-      TF_DIR: infra/environments/dev
-      API_URL:
-        sh: cd {{.TF_DIR}} && terraform output -raw app_service_url
-      STORAGE_ACCOUNT:
-        sh: cd {{.TF_DIR}} && terraform output -raw web_storage_account_name
-    cmds:
-      - |
-        if [ -z "{{.API_URL}}" ]; then
-          echo "Error: App Service is not enabled in dev."
-          echo "Set enable_app_service = true in infra/environments/dev/terraform.tfvars and run terraform apply first."
-          exit 1
-        fi
-      - sed 's|%%API_BASE_URL%%|{{.API_URL}}|g' frontend/index.html > /tmp/pollen-index.html
-      - az storage blob upload --account-name {{.STORAGE_ACCOUNT}} --auth-mode login --container-name '$web' --file /tmp/pollen-index.html --name index.html --overwrite
-      - rm /tmp/pollen-index.html
-      - echo "Frontend deployed to dev static website"
-
-  remote:deployfrontend:prod:
-    desc: Deploy frontend to Azure Blob Storage static website (prod)
-    vars:
-      TF_DIR: infra/environments/prod
-      API_URL:
-        sh: cd {{.TF_DIR}} && terraform output -raw app_service_url
-      STORAGE_ACCOUNT:
-        sh: cd {{.TF_DIR}} && terraform output -raw web_storage_account_name
-    cmds:
-      - |
-        if [ -z "{{.API_URL}}" ]; then
-          echo "Error: App Service is not enabled."
-          echo "Set enable_app_service = true in infra/environments/prod/terraform.tfvars and run terraform apply first."
-          exit 1
-        fi
-      - sed 's|%%API_BASE_URL%%|{{.API_URL}}|g' frontend/index.html > /tmp/pollen-index.html
-      - az storage blob upload --account-name {{.STORAGE_ACCOUNT}} --auth-mode login --container-name '$web' --file /tmp/pollen-index.html --name index.html --overwrite
-      - rm /tmp/pollen-index.html
-      - echo "Frontend deployed to prod static website"
-
-  # ========================================
-  # Azure Firewall Management
-  # ========================================
-
-  remote:allowip:dev:
-    desc: Add current IP to PostgreSQL firewall (dev)
-    vars:
-      TF_DIR: infra/environments/dev
-      PG_SERVER_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw postgres_server_name
-      RG_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw resource_group_name
-      MY_IP:
-        sh: curl -s https://api.ipify.org
-    cmds:
-      - echo "Adding IP {{.MY_IP}} to PostgreSQL firewall (dev)..."
-      - az postgres flexible-server firewall-rule create --resource-group {{.RG_NAME}} --name {{.PG_SERVER_NAME}} --rule-name allow-my-ip-$(date +%s) --start-ip-address {{.MY_IP}} --end-ip-address {{.MY_IP}}
-      - echo "Firewall rule created successfully!"
-      - echo "You can now connect to the database from {{.MY_IP}}"
-
-  remote:allowip:prod:
-    desc: Add current IP to PostgreSQL firewall (prod)
-    vars:
-      TF_DIR: infra/environments/prod
-      PG_SERVER_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw postgres_server_name
-      RG_NAME:
-        sh: cd {{.TF_DIR}} && terraform output -raw resource_group_name
-      MY_IP:
-        sh: curl -s https://api.ipify.org
-    cmds:
-      - echo "Adding IP {{.MY_IP}} to PostgreSQL firewall (prod)..."
-      - az postgres flexible-server firewall-rule create --resource-group {{.RG_NAME}} --name {{.PG_SERVER_NAME}} --rule-name allow-my-ip-$(date +%s) --start-ip-address {{.MY_IP}} --end-ip-address {{.MY_IP}}
-      - echo "Firewall rule created successfully!"
-      - echo "You can now connect to the database from {{.MY_IP}}"
-
-  # ========================================
-  # Utility Tasks
-  # ========================================
-
-  check:prereqs:
-    desc: Check if required tools are installed
-    cmds:
-      - echo "Checking prerequisites..."
-      - |
-        command -v docker >/dev/null 2>&1 || { echo "docker not found"; exit 1; }
-        echo "docker"
-      - |
-        command -v docker-compose >/dev/null 2>&1 || { echo "docker-compose not found"; exit 1; }
-        echo "docker-compose"
-      - |
-        command -v az >/dev/null 2>&1 || { echo "azure-cli not found"; exit 1; }
-        echo "azure-cli"
-      - |
-        command -v pg_dump >/dev/null 2>&1 || { echo "postgresql-client not found"; exit 1; }
-        echo "postgresql-client (pg_dump)"
-      - echo "All prerequisites met!"
+      - bash deploy/smoke_test.sh

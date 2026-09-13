@@ -1,0 +1,26 @@
+# Daily pollen ETL. Install to /etc/systemd/system/ alongside the timer:
+#   sudo cp deploy/systemd/pollen-pipeline.* /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pollen-pipeline.timer
+#
+# Run it by hand at any time with:
+#   sudo systemctl start pollen-pipeline.service
+#   journalctl -u pollen-pipeline -f
+
+[Unit]
+Description=Daily pollen forecast ETL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/pollen
+# One-shot container; --rm so nothing accumulates. systemd will not start a
+# second run while this one is active, so overlapping runs are impossible.
+ExecStart=/usr/bin/podman-compose --profile manual run --rm --no-deps pipeline
+# The CDS queue can be slow; give the whole run a generous ceiling but do not
+# let it bleed into the next day.
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=multi-user.target

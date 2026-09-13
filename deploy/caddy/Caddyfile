@@ -1,0 +1,24 @@
+# SITE_ADDRESS is ":80" for local development (plain HTTP) and the bare domain
+# in production, where Caddy then obtains and renews a certificate on its own.
+{$SITE_ADDRESS::80} {
+	encode zstd gzip
+
+	# API and health check go to FastAPI; everything else is a static file.
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle /health {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		root * /srv/web
+		file_server
+	}
+
+	log {
+		output stderr
+		format console
+	}
+}

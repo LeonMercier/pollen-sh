@@ -1,39 +1,17 @@
+.env
 *.grib
 *.zip
-.venv/
 __pycache__/
-.env
-.env.local
+*.py[cod]
+.venv/
 
-# Terraform files
-.terraform/
-*.tfstate
-*.tfstate.backup
-*.tfstate.lock.info
-.terraform.lock.hcl
-terraform.tfvars
-*.tfvars
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
+# Local overrides
+compose.override.yaml
 
-# Crash log files
-crash.log
-crash.*.log
-
-.azurite/
-
-# Docker
-docker-compose.override.yml
-
-# IDE files
+# IDE / editor
 *.swp
 *.swo
 *~
-
-# Databricks
-.databricks/
 
 # Other
 AGENTS.md
