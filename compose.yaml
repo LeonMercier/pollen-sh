@@ -42,9 +42,14 @@ services:
       - "${HTTP_PORT:-8080}:80"
       - "${HTTPS_PORT:-8443}:443"
     environment:
-      # ":80" locally (plain HTTP); the bare domain in production, which makes
-      # Caddy obtain and renew a certificate automatically.
+      # ":80" locally (plain HTTP). In production, the comma-separated list of
+      # names to serve; Caddy obtains and renews a certificate for each.
       SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+      # Set both in production to redirect the bare apex to the www host.
+      # Unset locally, where the matcher then defaults to a name that can never
+      # match and the redirect stays inert.
+      APEX_HOST: ${APEX_HOST:-apex.invalid}
+      WWW_HOST: ${WWW_HOST:-www.invalid}
     volumes:
       - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./web:/srv/web:ro

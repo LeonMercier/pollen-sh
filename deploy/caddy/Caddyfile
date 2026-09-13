@@ -1,7 +1,26 @@
-# SITE_ADDRESS is ":80" for local development (plain HTTP) and the bare domain
-# in production, where Caddy then obtains and renews a certificate on its own.
+# SITE_ADDRESS is ":80" for local development (plain HTTP). In production it is
+# the list of names Caddy should serve and obtain certificates for:
+#
+#   SITE_ADDRESS=pollencast.eu, www.pollencast.eu
+#
+# Both names must resolve to this host and port 80 must be reachable, or the
+# ACME HTTP-01 challenge cannot complete.
 {$SITE_ADDRESS::80} {
 	encode zstd gzip
+
+	# www is canonical; send the bare apex there.
+	#
+	# The redirect reuses {scheme} rather than hardcoding a protocol, so an
+	# HTTPS request is always redirected to HTTPS. (The registrar's forwarder
+	# this replaces answered https://pollencast.eu with a redirect to plain
+	# http://www.pollencast.eu, downgrading every apex visitor.)
+	#
+	# APEX_HOST is unset locally, where it defaults to a name no request can
+	# carry, so the matcher never fires and the block is inert.
+	@apex host {$APEX_HOST:apex.invalid}
+	handle @apex {
+		redir {scheme}://{$WWW_HOST:www.invalid}{uri} permanent
+	}
 
 	# API and health check go to FastAPI; everything else is a static file.
 	handle /api/* {

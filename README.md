@@ -121,10 +121,23 @@ Neither applies to Docker Compose.
 ## Deploying to a VPS
 
 1. Install Podman and Compose, clone the repo to `/opt/pollen`.
-2. Write `.env`. Set `SITE_ADDRESS` to the bare domain (e.g. `pollencast.eu`)
-   and `HTTP_PORT=80`, `HTTPS_PORT=443`. Caddy obtains and renews the
-   certificate on its own — there is no certbot to configure.
-3. Point the domain's A record at the VPS.
+2. Write `.env`:
+
+   ```bash
+   SITE_ADDRESS=pollencast.eu, www.pollencast.eu
+   APEX_HOST=pollencast.eu
+   WWW_HOST=www.pollencast.eu
+   HTTP_PORT=80
+   HTTPS_PORT=443
+   ```
+
+   Caddy obtains and renews a certificate for each name in `SITE_ADDRESS` on
+   its own — there is no certbot to configure. `APEX_HOST`/`WWW_HOST` drive a
+   301 from the bare apex to the www host, preserving the request scheme so an
+   HTTPS visitor is never bounced to plain HTTP.
+3. Point **both** names at the VPS with A records, and make sure port 80 is
+   reachable — Caddy needs it for the ACME HTTP-01 challenge. See
+   [DNS cutover](#dns-cutover).
 4. `podman-compose up -d --build`
 5. Run the pipeline once, then geocode (as above).
 6. Install the timer:
@@ -143,6 +156,37 @@ bind-mounted, so `web/` changes need only a `git pull`.
 
 Sizing: 2 GB RAM and 20 GB disk is comfortable. Pipeline peak RSS is under
 200 MB.
+
+### DNS cutover
+
+The zone starts out with the apex on the registrar's URL-forwarding service and
+`www` pointing at Azure blob storage:
+
+```
+pollencast.eu       A     65.108.94.145 (TTL 14400)  → NordName forwarder → 301 → http://www
+www.pollencast.eu   CNAME stwebpollenprod.z1.web.core.windows.net. (TTL 3600)
+```
+
+Both move onto the VPS. Lower the TTLs first and wait out the **old** values —
+publishing a shorter TTL does nothing for resolvers that already cached the long
+one:
+
+```
+T+0h     lower www 3600 → 300 and apex 14400 → 300 (change TTLs only)
+T+4h     apex A    → <VPS IP>   (this retires the registrar forwarder)
+         www CNAME → A record, <VPS IP>
+T+4h05   Caddy completes ACME for both names; verify, then tear down Azure
+T+2d     raise TTLs back to 3600 / 14400
+```
+
+Four hours, not one, because the apex A carries the longest old TTL. Expect a
+thin tail of stragglers beyond that from resolvers that clamp TTLs, so leave the
+Azure endpoint alive until it dies down.
+
+**Repoint `www` before deleting the Azure storage account.** A CNAME left
+pointing at `stwebpollenprod.z1.web.core.windows.net` after the account is gone
+is a subdomain-takeover vector: whoever claims that storage account name then
+serves content on `www.pollencast.eu`.
 
 ### Monitoring
 
