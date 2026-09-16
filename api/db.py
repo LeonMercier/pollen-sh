@@ -84,23 +84,59 @@ def _like_prefix(query: str) -> str:
 
 
 def search_cities(query: str, limit: int = 10) -> list[dict]:
-    """Cities whose ASCII name starts with `query`, most populous first."""
+    """Cities findable by a name starting with `query`, most populous first.
+
+    Matching is accent-insensitive and runs over every name form a city has --
+    its localised name, its ASCII form and its other-language names -- so "aht"
+    finds Ähtäri and "Loviisa" finds the town GeoNames calls Lovisa.
+
+    city_norm() is applied to the query only; the stored side is normalised at
+    write time by a generated column.
+    """
     if len(query) < 2:
         return []
 
     with pool().connection() as conn:
         rows = conn.execute(
             """
-            SELECT name, ascii_name, country_code
-            FROM cities
-            WHERE lower(ascii_name) LIKE lower(%s)
-            ORDER BY population DESC NULLS LAST
-            LIMIT %s
+            SELECT s.alias, s.canonical, s.country_code
+            FROM (
+                SELECT DISTINCT ON (c.geoname_id)
+                       a.alias,
+                       c.name         AS canonical,
+                       c.country_code,
+                       c.population
+                FROM city_alias a
+                JOIN cities c USING (geoname_id)
+                WHERE a.alias_norm LIKE city_norm(%(pattern)s)
+                -- Among the names of one city that match, prefer the one it is
+                -- actually called, then its ASCII form, then the spelling the
+                -- user literally typed, then the shortest. Without the third
+                -- rule, searching "Åbo" answers "Abo": both are length 3 and
+                -- plain A sorts before Å. Without the first two, abbreviations
+                -- in the alternatenames column outrank the real name.
+                ORDER BY c.geoname_id,
+                         (a.alias_norm = city_norm(c.name)) DESC,
+                         (a.alias_norm = city_norm(c.ascii_name)) DESC,
+                         (a.alias ILIKE %(pattern)s) DESC,
+                         length(a.alias), a.alias
+            ) s
+            ORDER BY s.population DESC NULLS LAST, s.alias
+            LIMIT %(limit)s
             """,
-            (_like_prefix(query), limit),
+            {"pattern": _like_prefix(query), "limit": limit},
         ).fetchall()
 
-    return [{"name": r[0], "ascii_name": r[1], "country_code": r[2]} for r in rows]
+    return [
+        # `canonical` is surfaced so the UI can disambiguate a bilingual place:
+        # "Loviisa (Lovisa)". It is omitted when it adds nothing.
+        {
+            "name": r[0],
+            "canonical": r[1] if r[1] != r[0] else None,
+            "country_code": r[2],
+        }
+        for r in rows
+    ]
 
 
 @dataclass(frozen=True)
@@ -112,17 +148,31 @@ class City:
 
 
 def lookup_city(city_name: str) -> City | None:
-    """Exact, case-insensitive match on either name form; most populous wins."""
+    """Resolve a name to a grid cell. Accent-insensitive, alias-aware.
+
+    The returned name is what to title the page with: the city's own name when
+    that is what was asked for (so "ahtari" comes back as "Ähtäri"), otherwise
+    the matched alias (so "Loviisa" stays "Loviisa" rather than flipping to the
+    Swedish "Lovisa").
+    """
     with pool().connection() as conn:
         row = conn.execute(
             """
-            SELECT name, timezone, lat_idx, lon_idx
-            FROM cities
-            WHERE lower(name) = lower(%s) OR lower(ascii_name) = lower(%s)
-            ORDER BY population DESC NULLS LAST
+            SELECT CASE WHEN city_norm(c.name) = city_norm(%(q)s)
+                        THEN c.name ELSE a.alias END,
+                   c.timezone, c.lat_idx, c.lon_idx
+            FROM city_alias a
+            JOIN cities c USING (geoname_id)
+            WHERE a.alias_norm = city_norm(%(q)s)
+            ORDER BY c.population DESC NULLS LAST,
+                     (a.alias_norm = city_norm(c.name)) DESC,
+                     -- Same reason as in search_cities: keep the accented
+                     -- spelling when that is what was asked for.
+                     (lower(a.alias) = lower(%(q)s)) DESC,
+                     length(a.alias), a.alias
             LIMIT 1
             """,
-            (city_name, city_name),
+            {"q": city_name},
         ).fetchone()
 
     if row is None:

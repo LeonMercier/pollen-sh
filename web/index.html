@@ -197,8 +197,13 @@
           activeIndex = -1;
           items.forEach(function (city) {
             const li = document.createElement("li");
-            li.textContent = `${city.name}, ${city.country_code}`;
-            li.dataset.value = city.ascii_name;
+            // Bilingual places carry a second name form. Show it so it is
+            // obvious that Loviisa and Lovisa are the same town.
+            const label = city.canonical
+              ? `${city.name} (${city.canonical})`
+              : city.name;
+            li.textContent = `${label}, ${city.country_code}`;
+            li.dataset.value = city.name;
             li.setAttribute("role", "option");
             li.addEventListener("mousedown", function (e) {
               e.preventDefault();
@@ -232,7 +237,9 @@
         }
 
         function selectSuggestion(city) {
-          input.value = city.ascii_name;
+          // Keep the name form the user was typing toward, not the
+          // canonical one -- the API resolves either.
+          input.value = city.name;
           closeSuggestions();
           form.requestSubmit();
         }

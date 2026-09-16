@@ -10,6 +10,12 @@ set -euo pipefail
 
 BASE="${1:-http://localhost:${HTTP_PORT:-8080}}"
 CITY="${SMOKE_CITY:-Helsinki}"
+# Ähtäri: an accented name, searched by its accented and plain prefixes.
+ACCENT_TERM="${SMOKE_ACCENT_TERM:-äht}"
+ACCENT_PLAIN="${SMOKE_ACCENT_PLAIN:-aht}"
+# Loviisa / Lovisa: the same bilingual town under its Finnish and Swedish names.
+BILINGUAL_A="${SMOKE_BILINGUAL_A:-Loviisa}"
+BILINGUAL_B="${SMOKE_BILINGUAL_B:-Lovisa}"
 failures=0
 
 check() {
@@ -43,6 +49,37 @@ if [ "$(printf '%s' "$cities" | grep -c '"name"')" -ge 1 ]; then
 	printf '  ok    autocomplete returned matches\n'
 else
 	printf '  FAIL  autocomplete returned nothing: %s\n' "${cities:0:200}"
+	failures=$((failures + 1))
+fi
+
+# Accent-insensitive prefix search: typing the accented or the plain form of a
+# name must both find it. Regression guard -- autocomplete used to match only
+# ascii_name, so "äht" found nothing while "ähtäri" worked.
+printf '  ....  accent-insensitive search\n'
+for term in "$ACCENT_TERM" "$ACCENT_PLAIN"; do
+	got=$(json "$BASE/api/cities?q=$(printf '%s' "$term" | od -An -tx1 | tr -d ' \n' | sed 's/../%&/g')" || true)
+	if printf '%s' "$got" | grep -q '"name"'; then
+		printf '  ok    "%s" returns matches\n' "$term"
+	else
+		printf '  FAIL  "%s" returns nothing\n' "$term"
+		failures=$((failures + 1))
+	fi
+done
+
+# Bilingual cities must be findable under either language and must resolve to
+# the same grid cell. GeoNames stores only one form in `name`.
+printf '  ....  bilingual name equivalence (%s / %s)\n' "$BILINGUAL_A" "$BILINGUAL_B"
+cell_of() {
+	json "$BASE/api/plots?city=$1" 2>/dev/null |
+		grep -o '"lat":[0-9.]*,"lon":[0-9.]*' | head -1
+}
+cell_a=$(cell_of "$BILINGUAL_A")
+cell_b=$(cell_of "$BILINGUAL_B")
+if [ -n "$cell_a" ] && [ "$cell_a" = "$cell_b" ]; then
+	printf '  ok    both names resolve to %s\n' "$cell_a"
+else
+	printf '  FAIL  %s -> [%s] but %s -> [%s]\n' \
+		"$BILINGUAL_A" "$cell_a" "$BILINGUAL_B" "$cell_b"
 	failures=$((failures + 1))
 fi
 

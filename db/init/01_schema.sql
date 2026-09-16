@@ -40,6 +40,22 @@ CREATE TABLE IF NOT EXISTS pollen_forecast (
     PRIMARY KEY (species, lat_idx, lon_idx)
 );
 
+-- Accent-insensitive name matching.
+--
+-- unaccent() is only STABLE by default (it depends on which dictionary is
+-- current), which makes it unusable in an index. Naming the dictionary
+-- explicitly removes that dependency, so the wrapper below can honestly be
+-- declared IMMUTABLE and indexed.
+--
+-- Keeping normalisation in the database rather than in Python means the ETL
+-- that writes names and the API that queries them cannot drift apart: there is
+-- exactly one definition of what "the same name" means.
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
+CREATE OR REPLACE FUNCTION city_norm(t text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE
+    AS $$ SELECT lower(unaccent('unaccent', t)) $$;
+
 -- Cities, snapped to grid indices rather than to coordinates: the join to
 -- pollen_forecast is then a plain integer match.
 CREATE TABLE IF NOT EXISTS cities (
@@ -57,10 +73,28 @@ CREATE TABLE IF NOT EXISTS cities (
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
--- Autocomplete is a case-insensitive prefix match on ascii_name. text_pattern_ops
--- is what makes LIKE 'foo%' index-usable.
-CREATE INDEX IF NOT EXISTS idx_cities_ascii_prefix
-    ON cities (lower(ascii_name) text_pattern_ops);
--- Exact lookup accepts either the localised or the ASCII name.
-CREATE INDEX IF NOT EXISTS idx_cities_lower_name  ON cities (lower(name));
-CREATE INDEX IF NOT EXISTS idx_cities_lower_ascii ON cities (lower(ascii_name));
+-- Every name a city can be found by: its localised name, its ASCII form, and
+-- the Latin-script entries from the GeoNames alternatenames column. Bilingual
+-- places need this -- Loviisa and Lovisa are the same town, and GeoNames stores
+-- only one of them in `name`.
+CREATE TABLE IF NOT EXISTS city_alias (
+    geoname_id integer NOT NULL REFERENCES cities (geoname_id) ON DELETE CASCADE,
+    alias      text    NOT NULL,
+    -- Normalised once at write time rather than per row at read time. This is
+    -- only possible because city_norm() is genuinely IMMUTABLE.
+    alias_norm text GENERATED ALWAYS AS (city_norm(alias)) STORED,
+    PRIMARY KEY (geoname_id, alias)
+);
+
+-- Superseded by city_alias: autocomplete used to prefix-match ascii_name
+-- directly, which found neither accented spellings nor other-language names.
+-- Dropped here rather than only omitted, so databases created before the
+-- change do not keep carrying three indexes nothing reads.
+DROP INDEX IF EXISTS idx_cities_ascii_prefix;
+DROP INDEX IF EXISTS idx_cities_lower_name;
+DROP INDEX IF EXISTS idx_cities_lower_ascii;
+
+-- Autocomplete is an accent-insensitive prefix match. text_pattern_ops is what
+-- makes LIKE 'foo%' index-usable.
+CREATE INDEX IF NOT EXISTS idx_city_alias_prefix
+    ON city_alias (alias_norm text_pattern_ops);

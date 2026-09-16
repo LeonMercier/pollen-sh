@@ -47,6 +47,18 @@ every cell, this differs only for cities within ~2 m of exactly equidistant
 between two neighbours, by at most 1.7 m — against a mean city-to-cell distance
 of 3.4 km. Hence no PostGIS.
 
+**Cities are findable under every name they have.** GeoNames stores one name per
+city, but bilingual places have more than one — Loviisa and Lovisa are the same
+town, as are Turku and Åbo. A `city_alias` table holds the localised name, the
+ASCII form and the Latin-script entries from the GeoNames alternatenames column,
+so either language finds the place. Matching is accent-insensitive, so "aht" and
+"äht" both find Ähtäri.
+
+Normalisation lives in the database as an IMMUTABLE `city_norm()` wrapper around
+`unaccent()`, and is materialised into a generated column. Keeping it in SQL
+rather than in Python means the ETL that writes names and the API that queries
+them cannot drift apart. Autocomplete runs in ~3 ms.
+
 **Loads are blue-green.** New data is staged, indexed and validated in a side
 table, then promoted in a single transaction along with its run metadata. A
 failed run changes nothing and yesterday's forecast stays live.
@@ -68,7 +80,8 @@ $EDITOR .env          # set POSTGRES_PASSWORD, CDSAPI_URL, CDSAPI_KEY
 Start the stack:
 
 ```bash
-podman-compose up -d --build
+podman-compose --profile manual build   # builds api and pipeline
+podman-compose up -d
 ```
 
 The site is on <http://localhost:8080>. `/health` reports 503 until a forecast
@@ -100,23 +113,40 @@ Set `COMPOSE="docker compose"` to use Docker instead of Podman.
 ```bash
 task psql                 # psql shell on the database
 task logs                 # follow all container logs
+task rebuild              # apply code changes (down, build all, up)
 task pipeline:reprocess   # rebuild from the cached GRIB, no CDS call
 task health               # query /health
 task clean                # delete all volumes (destroys the database)
 ```
 
-### Two podman-compose quirks
+### Applying a code change
+
+**Use `task rebuild`.** It stops the stack, rebuilds every image, and starts it
+again. `task up` on an already-running stack does *not* apply your changes.
+
+That is worth spelling out, because `podman-compose up -d --build` fails in two
+independent ways here:
+
+- **It cannot replace a running container.** The build succeeds, then container
+  creation fails with `name is already in use` for every service — and the old
+  code stays live. The errors scroll past among the build output and the command
+  does not obviously fail.
+- **It skips the pipeline entirely.** Services behind a profile are not built by
+  a plain `up --build`, so the `pipeline` image silently goes stale and will
+  happily run last week's code.
+
+`task build` covers both images (`--profile manual build`); `task rebuild` is
+`down` followed by `up`, which is the only sequence verified to put new code
+live.
+
+One more, unrelated to building:
 
 - **Always pass `--no-deps` to `run`.** Without it, podman-compose restarts the
   dependency graph and takes `api` and `caddy` down with it — the site would go
   offline every time the pipeline ran. The Taskfile and the systemd unit both
   pass it.
-- **Rebuild with a full `down` then `up`.** `podman-compose up -d --build api`
-  reports success but silently keeps the old container running, because podman
-  refuses to replace a container that `caddy` depends on. Use
-  `podman-compose down && podman-compose up -d --build` (`task down && task up`).
 
-Neither applies to Docker Compose.
+None of this applies to Docker Compose.
 
 ## Deploying to a VPS
 
@@ -138,7 +168,7 @@ Neither applies to Docker Compose.
 3. Point **both** names at the VPS with A records, and make sure port 80 is
    reachable — Caddy needs it for the ACME HTTP-01 challenge. See
    [DNS cutover](#dns-cutover).
-4. `podman-compose up -d --build`
+4. `task up` (or `podman-compose --profile manual build && podman-compose up -d`)
 5. Run the pipeline once, then geocode (as above).
 6. Install the timer:
 
@@ -151,8 +181,9 @@ Neither applies to Docker Compose.
    It fires at 10:20 UTC daily — CAMS guarantees the full forecast at 10:00.
    `journalctl -u pollen-pipeline -f` shows a run.
 
-Deploying a change is `git pull && podman-compose up -d --build`. The frontend is
-bind-mounted, so `web/` changes need only a `git pull`.
+Deploying a change is `git pull && task rebuild` — see
+[Applying a code change](#applying-a-code-change) for why `up --build` is not
+enough. The frontend is bind-mounted, so `web/` changes need only a `git pull`.
 
 Sizing: 2 GB RAM and 20 GB disk is comfortable. Pipeline peak RSS is under
 200 MB.
