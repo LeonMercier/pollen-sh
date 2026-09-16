@@ -12,7 +12,14 @@ services:
       - pg_data:/var/lib/postgresql/data
       # Only runs on a fresh volume. The pipeline reapplies the same file on
       # every run, so a schema change does not need a volume reset.
-      - ./db/init:/docker-entrypoint-initdb.d:ro
+      #
+      # The ",z" on every host bind mount below is an SELinux relabel request.
+      # Without it, an enforcing system (Fedora, RHEL) denies the container
+      # process read access to these paths. Lowercase z applies the shared
+      # container_file_t label; uppercase Z would stamp a private MCS category
+      # and lock the path to one container. The flag is a no-op where SELinux
+      # is not enabled, so it is safe to leave in everywhere.
+      - ./db/init:/docker-entrypoint-initdb.d:ro,z
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pollen} -d ${POSTGRES_DB:-pollen}"]
       interval: 10s
@@ -51,8 +58,8 @@ services:
       APEX_HOST: ${APEX_HOST:-apex.invalid}
       WWW_HOST: ${WWW_HOST:-www.invalid}
     volumes:
-      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./web:/srv/web:ro
+      - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
+      - ./web:/srv/web:ro,z
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

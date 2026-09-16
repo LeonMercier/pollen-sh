@@ -157,6 +157,32 @@ bind-mounted, so `web/` changes need only a `git pull`.
 Sizing: 2 GB RAM and 20 GB disk is comfortable. Pipeline peak RSS is under
 200 MB.
 
+### SELinux (Fedora, RHEL, Rocky)
+
+On an enforcing SELinux system, bind-mounted host paths are not readable by the
+container unless they carry a container label. Symptom:
+
+```
+SELinux is preventing ls from read access on the directory init
+scontext=system_u:system_r:container_t:s0:c305,c600
+tcontext=system_u:object_r:svirt_image_t:s0
+```
+
+Every host bind mount in `compose.yaml` therefore carries `,z`, which asks
+podman to relabel the source as `container_file_t` at mount time. Nothing extra
+to run — but two things are worth knowing:
+
+- **`z` relabels the path on the host**, persistently. Running
+  `restorecon -R .` over the repo reverts the labels and the denials come back.
+  Re-running `podman-compose up` relabels them again.
+- **Lowercase `z`, not uppercase `Z`.** `Z` stamps a private MCS category that
+  locks the path to a single container, which breaks the moment a second
+  container needs the same path.
+
+To confirm SELinux is the cause of some other denial, temporarily add
+`security_opt: ["label=disable"]` to the affected service. That is a diagnostic,
+not a fix — remove it once the real labelling issue is found.
+
 ### DNS cutover
 
 The zone starts out with the apex on the registrar's URL-forwarding service and
