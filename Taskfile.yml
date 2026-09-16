@@ -17,15 +17,30 @@ tasks:
   # ==========================================================================
   # Stack
   # ==========================================================================
+  # `up --build` is deliberately not used anywhere. It builds a new image but
+  # then fails to replace a container that is already running, so it reports
+  # success while leaving the old code live. It also skips the pipeline image,
+  # which sits behind a profile. Use `task rebuild` to apply code changes.
+  build:
+    desc: Build every image, including the profile-gated pipeline
+    cmds: ["{{.COMPOSE}} --profile manual build"]
+
   up:
-    desc: Build and start postgres, api and caddy
+    desc: Build and start the stack (use `task rebuild` if it is already running)
     cmds:
-      - "{{.COMPOSE}} up -d --build"
+      - task: build
+      - "{{.COMPOSE}} up -d"
       - 'echo "Site: http://localhost:${HTTP_PORT:-8080}"'
 
   down:
     desc: Stop the stack (data volumes persist)
     cmds: ["{{.COMPOSE}} down"]
+
+  rebuild:
+    desc: Apply code changes - stop, rebuild every image, start again
+    cmds:
+      - task: down
+      - task: up
 
   logs:
     desc: Follow logs from all services
