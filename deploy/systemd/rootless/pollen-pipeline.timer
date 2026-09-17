@@ -1,0 +1,16 @@
+# User timer -- see the .service file for installation and the linger
+# requirement.
+
+[Unit]
+Description=Run the pollen ETL daily
+
+[Timer]
+# CAMS guarantees the full forecast at 10:00 UTC; 10:20 leaves a buffer and the
+# randomised delay avoids hitting the API at the same second as everyone else.
+OnCalendar=*-*-* 10:20:00 UTC
+RandomizedDelaySec=10m
+# Replay a run missed while the machine was off. Needs lingering enabled.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -143,14 +143,16 @@ One more, unrelated to building:
 
 - **Always pass `--no-deps` to `run`.** Without it, podman-compose restarts the
   dependency graph and takes `api` and `caddy` down with it — the site would go
-  offline every time the pipeline ran. The Taskfile and the systemd unit both
+  offline every time the pipeline ran. The Taskfile and both systemd units
   pass it.
 
 None of this applies to Docker Compose.
 
 ## Deploying to a VPS
 
-1. Install Podman and Compose, clone the repo to `/opt/pollen`.
+1. Install Podman and Compose, and clone the repo. Rootful: `/opt/pollen`.
+   Rootless: somewhere the stack's own user owns, e.g. `~/pollen` — that is what
+   the rootless unit's `WorkingDirectory=%h/pollen` expects.
 2. Write `.env`:
 
    ```bash
@@ -165,21 +167,41 @@ None of this applies to Docker Compose.
    its own — there is no certbot to configure. `APEX_HOST`/`WWW_HOST` drive a
    301 from the bare apex to the www host, preserving the request scheme so an
    HTTPS visitor is never bounced to plain HTTP.
-3. Point **both** names at the VPS with A records, and make sure port 80 is
-   reachable — Caddy needs it for the ACME HTTP-01 challenge. See
+3. Make **both** names resolve to the VPS. The apex must be an A record (a
+   CNAME is illegal at a zone apex); `www` can be either an A record or a CNAME
+   to the apex — both work, the CNAME just keeps the IP in one place. Caddy's
+   apex→www redirect is HTTP-level and cannot stand in for a missing DNS record.
+   Port 80 must also be reachable for the ACME HTTP-01 challenge — see
+   [Rootless podman](#rootless-podman) if podman cannot bind it. See
    [DNS cutover](#dns-cutover).
 4. `task up` (or `podman-compose --profile manual build && podman-compose up -d`)
 5. Run the pipeline once, then geocode (as above).
-6. Install the timer:
+6. Install the timer. **Which unit depends on whether podman is rootless** —
+   see [Rootless podman](#rootless-podman). Rootless containers live in the
+   invoking user's storage, so a root-owned system unit would talk to a
+   different set of containers entirely and never find your database.
+
+   Rootless (run as the user that owns the stack, no sudo):
 
    ```bash
-   sudo cp deploy/systemd/pollen-pipeline.* /etc/systemd/system/
+   mkdir -p ~/.config/systemd/user
+   cp deploy/systemd/rootless/pollen-pipeline.* ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now pollen-pipeline.timer
+   sudo loginctl enable-linger $USER    # or it stops when you log out
+   ```
+
+   Rootful:
+
+   ```bash
+   sudo cp deploy/systemd/rootful/pollen-pipeline.* /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now pollen-pipeline.timer
    ```
 
    It fires at 10:20 UTC daily — CAMS guarantees the full forecast at 10:00.
-   `journalctl -u pollen-pipeline -f` shows a run.
+   `journalctl --user -u pollen-pipeline -f` (rootless) or
+   `journalctl -u pollen-pipeline -f` (rootful) shows a run.
 
 Deploying a change is `git pull && task rebuild` — see
 [Applying a code change](#applying-a-code-change) for why `up --build` is not
@@ -187,6 +209,90 @@ enough. The frontend is bind-mounted, so `web/` changes need only a `git pull`.
 
 Sizing: 2 GB RAM and 20 GB disk is comfortable. Pipeline peak RSS is under
 200 MB.
+
+### Rootless podman
+
+Rootless podman cannot publish ports below 1024:
+
+```
+rootlessport cannot expose privileged port 80 ... bind: permission denied
+```
+
+Note this is only about the *host* side of the publish. Inside the container
+Caddy binds 80 and 443 quite happily, so its own view of the world — and the
+redirects and ACME challenges it generates — stay correct whichever option you
+pick below.
+
+**Option A — lower the privileged-port floor (simplest).**
+
+```bash
+echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/99-rootless-ports.conf
+sudo sysctl --system
+```
+
+Then `HTTP_PORT=80` and `HTTPS_PORT=443` in `.env`. The trade-off is
+system-wide: any unprivileged process may now bind 80–1023, so a local attacker
+who already has code execution could squat on port 80 if the service ever
+releases it. On a single-purpose, single-admin VPS that is a small delta, and
+this is the remedy podman itself suggests.
+
+**Option B — keep the ports privileged, redirect into a high port.**
+
+Leave `HTTP_PORT=8080` / `HTTPS_PORT=8443` in `.env` and let the firewall do the
+translation:
+
+```bash
+sudo firewall-cmd --permanent --add-forward-port=port=80:proto=tcp:toport=8080
+sudo firewall-cmd --permanent --add-forward-port=port=443:proto=tcp:toport=8443
+sudo firewall-cmd --permanent --add-service=http --add-service=https
+sudo firewall-cmd --reload
+```
+
+Nothing unprivileged can bind 80/443, and the sysctl stays untouched. Costs one
+piece of host state that lives outside the repo, and the redirect applies to
+traffic arriving at the interface — connections made from the VPS to its own
+`localhost:80` are not translated, which only affects testing from the box
+itself.
+
+**Option C — run the stack rootful** (`sudo podman-compose ...`). Ports just
+work and the system-level systemd unit is the right one, at the cost of the
+isolation rootless buys you.
+
+Whatever you choose, keep it consistent: the stack and the pipeline timer must
+run under the *same* podman, or the pipeline will not find the database.
+
+### Client IPs and host networking
+
+Caddy runs with `network_mode: host`. That is not incidental — it is the only
+way to see real client addresses under rootless podman.
+
+Rootless podman forwards published ports through a `rootlessport` helper that
+SNATs every inbound connection. With a bridge network, every request reaches
+Caddy from the helper's address on podman's `10.89.0.0/24`, and the real client
+is gone before any application sees it. There is no header to recover it from:
+the rewrite happens at L3, not in a proxy, so `X-Forwarded-For` and
+`trusted_proxies` are irrelevant. Measured on this project:
+
+| Setup | `client_ip` Caddy logs |
+| --- | --- |
+| Bridge network + published port | `10.89.0.5` (the rootlessport helper) |
+| `network_mode: host` | the real client address |
+
+Consequences of host networking, all deliberate:
+
+- **Caddy has no ports: mapping.** `SITE_ADDRESS` decides what it binds —
+  `:8080` locally, the bare domains (so 80/443) in production.
+- **Caddy cannot resolve `api` by name**, because it is not on the compose
+  bridge. `api` is therefore published on `127.0.0.1:8000` and Caddy proxies to
+  `API_UPSTREAM`. Binding to loopback keeps it off the network: reachable from
+  the host, not from outside.
+- `postgres` and `pipeline` stay on the bridge and are unaffected.
+
+If you would rather keep Caddy isolated on the bridge and accept losing client
+IPs, set `network_mode` back to the bridge, restore a `ports:` mapping, and
+point `API_UPSTREAM` at `api:8000`. Running the stack rootful is also expected
+to preserve client IPs — rootful publishing uses plain DNAT with no SNAT — but
+that is untested here.
 
 ### SELinux (Fedora, RHEL, Rocky)
 

@@ -24,11 +24,11 @@
 
 	# API and health check go to FastAPI; everything else is a static file.
 	handle /api/* {
-		reverse_proxy api:8000
+		reverse_proxy {$API_UPSTREAM:127.0.0.1:8000}
 	}
 
 	handle /health {
-		reverse_proxy api:8000
+		reverse_proxy {$API_UPSTREAM:127.0.0.1:8000}
 	}
 
 	handle {

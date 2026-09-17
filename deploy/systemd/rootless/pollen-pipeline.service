@@ -1,0 +1,36 @@
+# Daily pollen ETL, for a stack running under ROOTLESS podman.
+#
+# Rootless containers live in the invoking user's own storage and network
+# namespace. A *system* unit runs as root and would therefore talk to a
+# completely different set of containers -- it would not find the postgres the
+# stack is actually using. So this has to be a user unit.
+#
+# Install (as the user that owns the stack, not with sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/rootless/pollen-pipeline.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pollen-pipeline.timer
+#
+# Required, or the timer stops when you log out and never fires unattended:
+#   sudo loginctl enable-linger $USER
+#
+# Run by hand / follow a run:
+#   systemctl --user start pollen-pipeline.service
+#   journalctl --user -u pollen-pipeline -f
+
+[Unit]
+Description=Daily pollen forecast ETL
+
+[Service]
+Type=oneshot
+# Adjust if the repo lives elsewhere. Must be writable by this user.
+WorkingDirectory=%h/pollen
+# One-shot container; --rm so nothing accumulates. --no-deps is essential:
+# without it podman-compose restarts the dependency graph and takes the site
+# down. systemd will not start a second run while this one is active.
+ExecStart=/usr/bin/podman-compose --profile manual run --rm --no-deps pipeline
+# The CDS queue can be slow; generous ceiling, but not into the next day.
+TimeoutStartSec=4h
+
+[Install]
+WantedBy=default.target

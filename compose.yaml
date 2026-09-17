@@ -38,6 +38,11 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       MAX_FORECAST_AGE_HOURS: ${MAX_FORECAST_AGE_HOURS:-36}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    # Published on loopback only, because Caddy runs in the host network
+    # namespace (see below) and so cannot reach the compose bridge by name.
+    # Not reachable from outside the machine.
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -45,9 +50,20 @@ services:
   caddy:
     image: docker.io/library/caddy:2-alpine
     restart: unless-stopped
-    ports:
-      - "${HTTP_PORT:-8080}:80"
-      - "${HTTPS_PORT:-8443}:443"
+    # Host networking, so Caddy sees real client IPs.
+    #
+    # Rootless podman forwards published ports through a `rootlessport` helper
+    # that SNATs every inbound connection: with a bridge network every request
+    # arrives from the helper's address on 10.89.0.0/24 and the real client is
+    # lost before Caddy ever sees it. There is no header to recover it from --
+    # the rewrite happens at L3, not in a proxy. Sharing the host's network
+    # namespace is the only way to keep the source address intact while staying
+    # rootless.
+    #
+    # The listening port now comes from SITE_ADDRESS, not a ports: mapping:
+    # ":8080" locally, and the bare domains in production (which means 80/443,
+    # and so needs net.ipv4.ip_unprivileged_port_start=80 when rootless).
+    network_mode: host
     environment:
       # ":80" locally (plain HTTP). In production, the comma-separated list of
       # names to serve; Caddy obtains and renews a certificate for each.
@@ -57,6 +73,7 @@ services:
       # match and the redirect stays inert.
       APEX_HOST: ${APEX_HOST:-apex.invalid}
       WWW_HOST: ${WWW_HOST:-www.invalid}
+      API_UPSTREAM: 127.0.0.1:${API_PORT:-8000}
     volumes:
       - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro,z
       - ./web:/srv/web:ro,z

@@ -1,5 +1,9 @@
-# Daily pollen ETL. Install to /etc/systemd/system/ alongside the timer:
-#   sudo cp deploy/systemd/pollen-pipeline.* /etc/systemd/system/
+# Daily pollen ETL, for a stack running under ROOTFUL podman (sudo podman-compose).
+# If your stack is rootless, use ../rootless/ instead -- a system unit runs as
+# root and would not see rootless containers at all.
+#
+# Install to /etc/systemd/system/ alongside the timer:
+#   sudo cp deploy/systemd/rootful/pollen-pipeline.* /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now pollen-pipeline.timer
 #
