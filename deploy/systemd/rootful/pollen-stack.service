@@ -1,0 +1,34 @@
+# Brings the pollen stack (postgres, api, caddy) up at boot, for ROOTFUL podman.
+# If your stack is rootless, use ../rootless/ instead.
+#
+# Podman has no daemon, so the compose `restart: unless-stopped` policy only
+# covers crashes while the machine is up -- nothing restarts the containers
+# after a reboot. podman-restart.service does not help either: it only starts
+# containers whose policy is `always`.
+#
+# Install:
+#   sudo cp deploy/systemd/rootful/pollen-stack.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pollen-stack.service
+#
+#   systemctl status pollen-stack
+#   journalctl -u pollen-stack
+
+[Unit]
+Description=Pollen forecast stack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/pollen
+# Containers left behind by an unclean shutdown make `up` fail with
+# "name is already in use", so clear them first. Volumes are untouched.
+ExecStartPre=-/usr/bin/podman-compose down
+ExecStart=/usr/bin/podman-compose up -d
+ExecStop=/usr/bin/podman-compose down
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target

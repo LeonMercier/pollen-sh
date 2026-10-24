@@ -1,0 +1,38 @@
+# Brings the pollen stack (postgres, api, caddy) up at boot, for ROOTLESS podman.
+#
+# Podman has no daemon, so the compose `restart: unless-stopped` policy only
+# covers crashes while the machine is up -- nothing restarts the containers
+# after a reboot. podman-restart.service does not help either: it only starts
+# containers whose policy is `always`.
+#
+# Install (as the user that owns the stack, not with sudo):
+#   cp deploy/systemd/rootless/pollen-stack.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now pollen-stack.service
+#
+# Required, or the user manager (and so this unit) never starts at boot:
+#   sudo loginctl enable-linger $USER
+#
+#   systemctl --user status pollen-stack
+#   journalctl --user -u pollen-stack
+
+[Unit]
+Description=Pollen forecast stack
+# User managers cannot see network-online.target; podman ships this stand-in.
+Wants=podman-user-wait-network-online.service
+After=podman-user-wait-network-online.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Adjust if the repo lives elsewhere. Must match pollen-pipeline.service.
+WorkingDirectory=%h/pollen
+# Containers left behind by an unclean shutdown make `up` fail with
+# "name is already in use", so clear them first. Volumes are untouched.
+ExecStartPre=-/usr/bin/podman-compose down
+ExecStart=/usr/bin/podman-compose up -d
+ExecStop=/usr/bin/podman-compose down
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target
