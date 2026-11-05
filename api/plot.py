@@ -160,7 +160,9 @@ def build_figures(forecast: Forecast, timezone_name: str, city_name: str) -> dic
         figures[display_name] = {
             "data": payload["data"],
             "layout": payload["layout"],
-            "config": {"responsive": True},
+            # plotly.js 4 shows an "Upload to Cloud" button by default, which
+            # sends the chart to cloud.plotly.com. Keep it off.
+            "config": {"responsive": True, "showSendToCloud": False},
         }
         # "Active" means a sustained signal, not a single spike.
         activity[display_name] = sum(v > _VALUE_FLOOR for v in values) >= 10
